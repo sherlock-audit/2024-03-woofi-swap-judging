@@ -2,8 +2,6 @@
 
 Source: https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/68 
 
-The protocol has acknowledged this issue.
-
 ## Found by 
 mstpr-brainbot
 ## Summary
@@ -198,6 +196,23 @@ Escalations have been resolved successfully!
 
 Escalation status:
 - [mstpr](https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/68/#issuecomment-2039575831): accepted
+
+**sherlock-admin3**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/woonetwork/WooPoolV2/pull/116
+
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
+**fb-alexcq**
+
+Fixes merged:
+https://github.com/woonetwork/WooPoolV2/commit/8b086a35b846bac52547abef5b8bb5a2999208bd
+https://github.com/woonetwork/WooPoolV2/commit/48737fcbbe315c8f835960193dd3dfdbb2b454d7
+
 
 # Issue M-1: Potential damages due to incorrect implementation of the ````ZIP```` algorithm 
 
@@ -998,7 +1013,9 @@ index e7a6ae8..9440089 100644
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/woonetwork/WooPoolV2/pull/110.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/woonetwork/WooPoolV2/pull/110
+
 
 **WangSecurity**
 
@@ -1012,9 +1029,15 @@ PoC request not allowed.
 
 We decided to downgrade it to med cause the cost of such attack is extremely high.
 
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue M-4: WooFi oracle can fail to validate its price with Chainlink price feed 
 
 Source: https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/41 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 Avci, Bandit, Dliteofficial, infect3d, klaus, mstpr-brainbot
@@ -1117,6 +1140,10 @@ and the result is "0"
 I asked Head of Judging and he allowed me to use the new context.
 
 Moreover, the information about which tokens will be used (the ones mentioned in the above comment) was unavailable to watsons, and README says any token. On top of it, it's infact unientended design. Therefore, Medium -> core functionality break -> the `price` function will validate 0 price from chainlink when it shouldn't do this.
+
+**fb-alexcq**
+
+The wooPP by default only supports selected list of tokens, manually added by admins (with offchain market making scripts). So this case for base/quote price goes beyond decimal 8 will never happen.
 
 # Issue M-5: Swaps can happen without changing the price for the next trade due to gamma = 0 
 
@@ -1513,7 +1540,9 @@ Update `WooCrossChainRouterV4.crossSwap()` to check for the `bridgeAmount` being
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/woonetwork/WooPoolV2/pull/112/commits/151443bf3c780f4e45796312591c61e1bd188122.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/woonetwork/WooPoolV2/pull/112/commits/151443bf3c780f4e45796312591c61e1bd188122
+
 
 **WangSecurity**
 
@@ -1526,6 +1555,10 @@ Initially, it was selected as a duplicate of 141, but it's not. 141 is invalid a
 > Please think about the actual impact.
 
 You've deleted an escalation for this issue.
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-7: Medium5-CrossChainWETHSwapFeesChargedUnnecesarily 
 
@@ -1982,6 +2015,16 @@ Escalation status:
 
 @CarlosAlegreUr want to again thank you for being very responsive and allocating so much time to correctly resolve this escalation. Great finding honestly, just wasn't sure how to correctly interpret it. Thank you very much again!
 
+**sherlock-admin3**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/woonetwork/WooPoolV2/pull/124
+
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue M-8: In the function _handleERC20Received, the fee was incorrectly charged 
 
 Source: https://github.com/sherlock-audit/2024-03-woofi-swap-judging/issues/114 
@@ -2084,5 +2127,11 @@ function _handleERC20Received(
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/woonetwork/WooPoolV2/pull/112/commits/be8655bf5d9660684eff1e2c12ff5d140fddc474.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/woonetwork/WooPoolV2/pull/112/commits/be8655bf5d9660684eff1e2c12ff5d140fddc474
+
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
 
